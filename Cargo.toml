@@ -1,0 +1,10 @@
+[package]
+name = "ping_list"
+version = "0.1.0"
+authors = ["shawn <q-x64@live.com>"]
+edition = "2018"
+
+[dependencies]
+structopt = "0.2"
+serde_json = "1.0"
+tokio-ping = "0.2"
