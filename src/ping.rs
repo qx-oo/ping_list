@@ -1,40 +1,81 @@
 use crate::err::Error;
+use lazy_static::lazy_static;
 use regex::Regex;
-use std::collections::HashMap;
 use std::net::IpAddr;
 use std::net::ToSocketAddrs;
+use std::process;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use lazy_static;
-
-static PING_REGEX: &'static str = r"\d{2} bytes from.*time=(.*) ms";
+use std::thread;
+use std::time::Instant;
 
 lazy_static! {
-    static ref PING_REGEX: &'static str = r"\d{2} bytes from.*time=(.*) ms";
-    static ref reg: Regex = {
-        match Regex::new(re: &str) {}
-    }
+    static ref PING_REGEX: Regex = { Regex::new(r"\d{2} bytes from.*time=(?P<ts>.*) ms").unwrap() };
 }
 
-pub fn ping_host_list(hosts: &Vec<String>) -> Result<HashMap<String, u32>, Error> {
-    let share_v = Arc::new(Mutex::new(HashMap::<String, u32>::new()));
+#[derive(Debug)]
+pub struct HostInfo {
+    host: String,
+    time: f64,
+    resolve: f64,
+}
+
+pub fn ping_host_list(hosts: &Vec<String>) -> Result<Vec<HostInfo>, Error> {
+    let share_v = Arc::new(Mutex::new(Vec::<HostInfo>::new()));
+    let child_lst = hosts
+        .iter()
+        .map(|host| {
+            let local_v = share_v.clone();
+            let h = host.clone();
+            thread::spawn(move || {
+                let start = Instant::now();
+                let addr = match resolve(&h) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        println!("thread error: {:?}", e);
+                        process::exit(1);
+                    }
+                };
+                let duration = start.elapsed();
+                let avg_ts = match ping_host(&addr) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        println!("thread error: {:?}", e);
+                        process::exit(1);
+                    }
+                };
+                let mut lst = local_v.lock().unwrap();
+                lst.push(HostInfo {
+                    host: h,
+                    time: avg_ts,
+                    resolve: duration.as_millis() as f64,
+                });
+                drop(lst);
+            })
+        })
+        .collect::<Vec<_>>();
+    for child in child_lst {
+        child.join().unwrap();
+    }
     let lock = match Arc::try_unwrap(share_v) {
         Ok(res) => res,
-        Err(_) => Err("Get share_v share_v fail")?,
+        Err(_) => Err("Get share_v fail")?,
     };
     let val = match lock.into_inner() {
         Ok(res) => res,
-        Err(_) => Err("Get share_v share_v fail")?,
+        Err(_) => Err("Get share_v fail")?,
     };
     Ok(val)
 }
 
-pub fn ping_host(addr: &IpAddr) -> Result<u32, Error> {
+pub fn ping_host(addr: &IpAddr) -> Result<f64, Error> {
     let ip = format!("{}", addr);
     let ping = Command::new("ping").args(&["-c", "4", &ip]).output()?;
-    let output = String::from_utf8_lossy(&ping.stdout);
-    println!("output: {:?}", output);
-    Ok(0)
+    let output = String::from_utf8_lossy(&ping.stdout).to_owned().to_string();
+    let ts_lst = match_ping_ts(&output);
+    let sum = ts_lst.iter().sum::<f64>();
+    let avg_ts = sum / (ts_lst.len() as f64);
+    Ok(avg_ts)
 }
 
 fn resolve(host: &str) -> Result<IpAddr, Error> {
@@ -53,22 +94,38 @@ fn resolve(host: &str) -> Result<IpAddr, Error> {
     }
 }
 
-fn match_ping_ts(text: &String) -> Option<f64> {
-    let re = Regex::new(PING_REGEX);
+fn match_ping_ts(text: &String) -> Vec<f64> {
+    PING_REGEX
+        .captures_iter(&text)
+        .map(|c| {
+            let ts = match c.name("ts") {
+                Some(n) => n.as_str(),
+                None => "0",
+            };
+            match ts.parse::<f64>() {
+                Ok(n) => n,
+                Err(_) => 0.0f64,
+            }
+        })
+        .filter(|&n| n != 0.0f64)
+        .collect::<Vec<f64>>()
 }
-
-// fn send_icmp_packet(addr: IpAddr, timeout: u64) -> Result<u32, Error> {
-//     let icmp = Layer4(Ipv4(IpNextHeaderProtocols::Icmp));
-//     Ok(2)
-// }
 
 #[cfg(test)]
 mod test {
-    use super::{ping_host, resolve};
-    // use super::send_icmp_packet;
+    use super::{match_ping_ts, ping_host, ping_host_list, resolve};
+    #[test]
+    fn test_ping_host_list() {
+        let test_lst: Vec<String> = vec!["www.google.com".to_owned(), "www.baidu.com".to_owned()];
+        let info_lst = ping_host_list(&test_lst).unwrap();
+        println!("info_lst: {:?}", info_lst);
+    }
     #[test]
     fn test_resolve() {
         let ips = resolve("www.google.com");
+        println!("ips: {:?}", ips);
+        assert!(ips.is_ok());
+        let ips = resolve("127.0.0.1");
         println!("ips: {:?}", ips);
         assert!(ips.is_ok());
     }
@@ -80,15 +137,20 @@ mod test {
             Err(e) => println!("error: {:?}", e),
         }
     }
-    // #[test]
-    // fn test_send_icmp_packet() {
-    //     let ipaddr = "223.6.6.6".parse().unwrap();
-    //     match send_icmp_packet(ipaddr, 1) {
-    //         Ok(t) => println!("t: {}", t),
-    //         Err(e) => {
-    //             println!("error: {:?}", e);
-    //         }
-    //     };
-    //     assert!(true)
-    // }
+    #[test]
+    fn test_match_ping_ts() {
+        let data = "PING 223.6.6.6 (223.6.6.6): 56 data bytes
+        64 bytes from 223.6.6.6: icmp_seq=0 ttl=117 time=16.369 ms
+        64 bytes from 223.6.6.6: icmp_seq=1 ttl=117 time=123d ms
+        64 bytes from 223.6.6.6: icmp_seq=2 ttl=117 time=14.516 ms
+        64 bytes from 223.6.6.6: icmp_seq=3 ttl=117 time=15.594 ms
+        
+        --- 223.6.6.6 ping statistics ---
+        4 packets transmitted, 4 packets received, 0.0% packet loss
+        round-trip min/avg/max/stddev = 14.516/15.291/16.369/0.745 ms"
+            .to_owned();
+        let lst = match_ping_ts(&data);
+        println!("lst: {:?}", lst);
+        assert_eq!(lst.len(), 3);
+    }
 }
