@@ -15,11 +15,18 @@ lazy_static! {
 
 #[derive(Debug)]
 pub struct HostInfo {
-    host: String,
-    time: f64,
-    resolve: f64,
+    pub host: String,
+    pub time: f64,
+    pub resolve: f64,
 }
 
+/// Ping hosts
+///
+/// # Usage:
+/// ```
+/// let test_lst: Vec<String> = vec!["www.google.com".to_owned()];
+/// let info_lst = ping_host_list(&test_lst).unwrap();
+/// ```
 pub fn ping_host_list(hosts: &Vec<String>) -> Result<Vec<HostInfo>, Error> {
     let share_v = Arc::new(Mutex::new(Vec::<HostInfo>::new()));
     let child_lst = hosts
@@ -57,27 +64,38 @@ pub fn ping_host_list(hosts: &Vec<String>) -> Result<Vec<HostInfo>, Error> {
     for child in child_lst {
         child.join().unwrap();
     }
+    let mut lst = share_v.lock().unwrap();
+    lst.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap());
+    drop(lst);
     let lock = match Arc::try_unwrap(share_v) {
         Ok(res) => res,
         Err(_) => Err("Get share_v fail")?,
     };
-    let val = match lock.into_inner() {
-        Ok(res) => res,
-        Err(_) => Err("Get share_v fail")?,
-    };
-    Ok(val)
+    lock.into_inner().map_err(|_| "Get share_v fail".into())
 }
 
+/// Call systeam ping command.
 pub fn ping_host(addr: &IpAddr) -> Result<f64, Error> {
     let ip = format!("{}", addr);
-    let ping = Command::new("ping").args(&["-c", "4", &ip]).output()?;
-    let output = String::from_utf8_lossy(&ping.stdout).to_owned().to_string();
-    let ts_lst = match_ping_ts(&output);
-    let sum = ts_lst.iter().sum::<f64>();
-    let avg_ts = sum / (ts_lst.len() as f64);
-    Ok(avg_ts)
+    Command::new("ping")
+        .args(&["-c", "3", &ip])
+        .output()
+        .map(|ping| {
+            let output = String::from_utf8_lossy(&ping.stdout).to_owned().to_string();
+            let ts_lst = match_ping_ts(&output);
+            if ts_lst.len() == 0 {
+                std::f64::INFINITY
+            } else {
+                let sum = ts_lst.iter().sum::<f64>();
+                let mut avg = sum / (ts_lst.len() as f64);
+                avg = ((avg * 100f64) as i64) as f64;
+                avg / 100f64
+            }
+        })
+        .map_err(|e| e.into())
 }
 
+/// Get ip by host.
 fn resolve(host: &str) -> Result<IpAddr, Error> {
     let ips: std::io::Result<Vec<IpAddr>> = (host, 0)
         .to_socket_addrs()
@@ -104,10 +122,10 @@ fn match_ping_ts(text: &String) -> Vec<f64> {
             };
             match ts.parse::<f64>() {
                 Ok(n) => n,
-                Err(_) => 0.0f64,
+                Err(_) => 0f64,
             }
         })
-        .filter(|&n| n != 0.0f64)
+        .filter(|&n| n != 0f64)
         .collect::<Vec<f64>>()
 }
 
@@ -132,10 +150,8 @@ mod test {
     #[test]
     fn test_ping_host() {
         let ipaddr = "223.6.6.6".parse().unwrap();
-        match ping_host(&ipaddr) {
-            Ok(res) => println!("res: {:?}", res),
-            Err(e) => println!("error: {:?}", e),
-        }
+        let res = ping_host(&ipaddr);
+        assert!(res.is_ok());
     }
     #[test]
     fn test_match_ping_ts() {
